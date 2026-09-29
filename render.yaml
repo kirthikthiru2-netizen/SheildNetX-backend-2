@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: shieldnetx-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: shieldnetx-db
+          property: connectionString
+      # Secrets below are intentionally left blank here (sync: false) so
+      # Render prompts you to type them in the dashboard instead of storing
+      # them in this file / your GitHub repo.
+      - key: GROQ_API_KEYS
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY_2
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+
+databases:
+  - name: shieldnetx-db
+    plan: free
+    databaseName: shieldnetx
+    user: shieldnetx
