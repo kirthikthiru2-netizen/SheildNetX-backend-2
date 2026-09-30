@@ -32,6 +32,8 @@ import re
 import json
 import hashlib
 import tempfile
+import gc
+import asyncio
 import logging
 from datetime import datetime, timezone
 from functools import partial
@@ -39,6 +41,7 @@ from functools import partial
 import requests
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query
 from fastapi.responses import Response
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -56,6 +59,29 @@ except ImportError:
     pass
 
 router = APIRouter(prefix="/apk", tags=["apk-analysis"])
+
+# --- Memory guards (Render free tier = 512 MB) -------------------------------
+# Override on Render with env vars MAX_APK_MB / DEEP_DECOMPILE_MAX_MB.
+MAX_APK_BYTES = int(os.getenv("MAX_APK_MB", "50")) * 1024 * 1024
+DEEP_DECOMPILE_MAX_BYTES = int(os.getenv("DEEP_DECOMPILE_MAX_MB", "15")) * 1024 * 1024
+MAX_STRINGS = 250_000       # cap on unique DEX strings kept in RAM
+MAX_STRING_LEN = 300        # truncate any single string
+# Only these justify the (very heavy) full-DEX decompile pass. Plain
+# reflection / crypto show up in almost every app and are not worth it.
+DEEP_DECOMPILE_TRIGGERS = (
+    "DexClassLoader", "PathClassLoader", "Ljava/lang/Runtime;->exec",
+    "ProcessBuilder", "SmsManager", "Landroid/telephony/SmsManager;",
+)
+# One analysis at a time per process — two parallel androguard runs is how
+# a 512 MB instance gets killed.
+_ANALYSIS_LOCK = asyncio.Lock()
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -206,17 +232,29 @@ def run_static_analysis(apk_path: str) -> dict:
 
 def extract_strings_and_urls(apk_path: str) -> tuple[list[str], set[str]]:
     """Pull raw strings out of the DEX to find embedded URLs / API patterns
-    without needing a full decompile."""
+    without needing a full decompile. Strings are de-duplicated, truncated
+    and capped so a huge multi-dex APK can't balloon memory."""
     import zipfile
 
-    raw_strings: list[str] = []
+    unique: dict[str, None] = {}
     with zipfile.ZipFile(apk_path) as z:
         for name in z.namelist():
-            if name.endswith(".dex"):
-                data = z.read(name)
-                # crude but fast: pull printable ASCII runs of length >= 6
-                for match in re.finditer(rb"[\x20-\x7e]{6,}", data):
-                    raw_strings.append(match.group().decode("ascii", errors="ignore"))
+            if not name.endswith(".dex"):
+                continue
+            data = z.read(name)
+            # crude but fast: pull printable ASCII runs of length >= 6
+            for match in re.finditer(rb"[\x20-\x7e]{6,}", data):
+                unique.setdefault(
+                    match.group()[:MAX_STRING_LEN].decode("ascii", errors="ignore"), None
+                )
+                if len(unique) >= MAX_STRINGS:
+                    break
+            del data
+            if len(unique) >= MAX_STRINGS:
+                break
+
+    raw_strings = list(unique)
+    del unique
 
     urls = set()
     for s in raw_strings:
@@ -412,6 +450,9 @@ def find_and_decompile_suspicious_methods(
             seen.add(method_key)
     except Exception:
         pass  # best-effort — return whatever we found before any failure
+    finally:
+        del apk, dex, dx
+        gc.collect()
 
     return results
 
@@ -703,32 +744,67 @@ def verdict_for(score: float) -> str:
 # Route
 # ---------------------------------------------------------------------------
 
+async def _save_upload(file: UploadFile) -> tuple[str, str, int]:
+    """Stream the upload to a temp file in 1 MB chunks while hashing it, so
+    the whole APK is never held in RAM. Returns (path, sha256, size)."""
+    if not (file.filename or "").lower().endswith(".apk"):
+        raise HTTPException(status_code=400, detail="File must be a .apk")
+
+    hasher = hashlib.sha256()
+    size = 0
+    tmp = tempfile.NamedTemporaryFile(suffix=".apk", delete=False)
+    try:
+        with tmp:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_APK_BYTES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"APK too large ({MAX_APK_BYTES // (1024 * 1024)}MB limit)",
+                    )
+                hasher.update(chunk)
+                tmp.write(chunk)
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    except BaseException:
+        _safe_unlink(tmp.name)
+        raise
+    return tmp.name, hasher.hexdigest(), size
+
+
+async def _run_analysis(file: UploadFile, force_rescan: bool, db: Session) -> ApkAnalysisResponse:
+    tmp_path, sha256, size = await _save_upload(file)
+    try:
+        async with _ANALYSIS_LOCK:
+            return await run_in_threadpool(
+                _analyze_apk_file, file.filename, tmp_path, sha256, size, force_rescan, db,
+            )
+    finally:
+        _safe_unlink(tmp_path)
+
+
 @router.post("/analyze", response_model=ApkAnalysisResponse)
 async def analyze_apk(
     file: UploadFile = File(...),
     force_rescan: bool = Query(False, description="Skip cache and re-run full analysis"),
     db: Session = Depends(get_db),
 ):
-    contents = await file.read()
-    return await _analyze_apk_contents(file.filename, contents, force_rescan, db)
+    return await _run_analysis(file, force_rescan, db)
 
 
-async def _analyze_apk_contents(
-    filename: str, contents: bytes, force_rescan: bool, db: Session,
+def _analyze_apk_file(
+    filename: str, tmp_path: str, sha256: str, file_size: int,
+    force_rescan: bool, db: Session,
 ) -> ApkAnalysisResponse:
     """Core single-APK analysis pipeline. Shared by the single-file /analyze
     route and the /analyze/batch route so both stay in lockstep — one
     scoring/caching/blocklist implementation, not two copies to keep in sync.
+    Runs in a worker thread (blocking androguard/LLM calls must not freeze
+    the event loop).
     """
-    if not filename.lower().endswith(".apk"):
-        raise HTTPException(status_code=400, detail="File must be a .apk")
-
-    if len(contents) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
-    if len(contents) > 150 * 1024 * 1024:  # 150MB safety cap
-        raise HTTPException(status_code=400, detail="APK too large (150MB limit)")
-
-    sha256 = hashlib.sha256(contents).hexdigest()
 
     # Dedup: if we've already fully analyzed this exact APK before (by
     # content hash, not filename), return the cached verdict instead of
@@ -773,10 +849,6 @@ async def _analyze_apk_contents(
             blocklist_match=cached_blocklist_match,
         )
 
-    with tempfile.NamedTemporaryFile(suffix=".apk", delete=False) as tmp:
-        tmp.write(contents)
-        tmp_path = tmp.name
-
     try:
         try:
             static_info = run_static_analysis(tmp_path)
@@ -796,8 +868,20 @@ async def _analyze_apk_contents(
         # already found something worth investigating further — keeps
         # clean APKs fast while giving GenAI real code for the ones that
         # actually need deeper scrutiny.
+        # Release the APK object and the big string list before the heavy
+        # pass — they're no longer needed.
+        static_info.pop("apk_object", None)
+        raw_strings = None
+        gc.collect()
+
+        # AnalyzeAPK loads the entire DEX into memory (often several times
+        # the APK size), so only run it for genuinely suspicious API hits
+        # and only on APKs small enough to fit.
         decompiled_methods = []
-        if api_findings:
+        if (
+            file_size <= DEEP_DECOMPILE_MAX_BYTES
+            and any(f.pattern in DEEP_DECOMPILE_TRIGGERS for f in api_findings)
+        ):
             decompiled_methods = find_and_decompile_suspicious_methods(tmp_path)
 
         prompt = build_ai_prompt(
@@ -999,8 +1083,7 @@ async def analyze_apk_batch(
     items: list[BatchAnalysisItem] = []
     for f in files:
         try:
-            contents = await f.read()
-            result = await _analyze_apk_contents(f.filename, contents, force_rescan, db)
+            result = await _run_analysis(f, force_rescan, db)
             items.append(BatchAnalysisItem(filename=f.filename, success=True, result=result))
         except HTTPException as e:
             # One bad file (wrong extension, empty, too large, unparseable)
