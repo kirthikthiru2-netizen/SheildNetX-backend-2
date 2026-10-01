@@ -7,4 +7,4 @@ androguard==4.1.4
 python-multipart==0.0.9
 sqlalchemy==2.0.35
 reportlab==4.2.5
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.10
